@@ -12,6 +12,7 @@ from scipy.interpolate import RegularGridInterpolator
 import base64
 import io
 import uuid
+import numpy as np
 
 # Global vars
 sail_polar_data = None
@@ -181,6 +182,17 @@ def create_dash_app():
         ),
         dcc.Store(id='relayout-store', data=None),
         dcc.Store(id='ingestion-status-store', data=False),
+        dcc.Checklist(
+            id='plot-toggles',
+            options=[
+                {'label': 'Actual Speed', 'value': 'actual'},
+                {'label': 'Theoretical Speed', 'value': 'theoretical'},
+                {'label': 'Wind Speed', 'value': 'wind'},
+            ],
+            value=['actual', 'theoretical'],  # Default selected values
+            inline=True,
+            style={'margin': '10px'}
+        ),
         dcc.Dropdown(
             id='session-selector',
             options=[],
@@ -217,25 +229,25 @@ def create_dash_app():
     [Input('interval-component', 'n_intervals'),
      Input('plot-mode-button', 'n_clicks'),
      Input('start-stop-button', 'n_clicks'),
-     Input('session-selector', 'value')],
+     Input('session-selector', 'value'),
+     Input('plot-toggles', 'value')],
     [State('live-graph', 'relayoutData'),
      State('relayout-store', 'data'),
      State('ingestion-status-store', 'data')]
     )
     def update_graph(n, n_clicks_plot, n_clicks_ingestion, selected_session,
-                    relayout_data, stored_relayout_data, ingestion_status):
+                    active_plots, relayout_data, stored_relayout_data, ingestion_status):
         conn = initialize_database()
         
-        # Determine which session to display
         session_to_display = selected_session if selected_session else current_session_id
         
         if session_to_display:
             df = pd.read_sql_query(
-                "SELECT timestamp, speed, theoretical_speed FROM sensor_data "
+                "SELECT timestamp, speed, theoretical_speed, wind_speed FROM sensor_data "
                 "WHERE session_id = ? ORDER BY timestamp ASC",
                 conn, params=(session_to_display,))
         else:
-            df = pd.DataFrame(columns=['timestamp', 'speed', 'theoretical_speed'])
+            df = pd.DataFrame(columns=['timestamp', 'speed', 'theoretical_speed', 'wind_speed'])
         
         conn.close()
 
@@ -243,15 +255,37 @@ def create_dash_app():
         fig = go.Figure()
 
         if plot_mode == "default":
-            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['speed'], 
-                                name='Actual Speed', mode='lines+markers'))
-            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['theoretical_speed'], 
-                                name='Theoretical Speed', mode='lines+markers'))
+            if 'actual' in active_plots:
+                fig.add_trace(go.Scatter(
+                    x=df['timestamp'], 
+                    y=df['speed'],
+                    name='Actual Speed',
+                    mode='lines+markers'
+                ))
+
+            if 'theoretical' in active_plots:
+                fig.add_trace(go.Scatter(
+                    x=df['timestamp'],
+                    y=df['theoretical_speed'],
+                    name='Theoretical Speed',
+                    mode='lines+markers'
+                ))
+
+            if 'wind' in active_plots:
+                fig.add_trace(go.Scatter(
+                    x=df['timestamp'],
+                    y=df['wind_speed'],
+                    name='Wind Speed',
+                    mode='lines+markers'
+                ))
         else:
             net_values = df['speed'] - df['theoretical_speed']
-            fig.add_trace(go.Scatter(x=df['timestamp'], y=net_values, 
-                                name='Net Value (Actual - Theoretical)', 
-                                mode='lines+markers'))
+            fig.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=net_values,
+                name='Net Value (Actual - Theoretical)',
+                mode='lines+markers'
+            ))
 
         rangeslider_visible = not data_ingestion_running
 
