@@ -13,6 +13,7 @@ import base64
 import io
 import uuid
 import numpy as np
+import plotly.express as px
 
 # Global vars
 sail_polar_data = None
@@ -41,6 +42,8 @@ def initialize_database():
                         theoretical_speed REAL,
                         wind_speed REAL,
                         wind_angle REAL,
+                        latitude REAL,
+                        longitude REAL,
                         PRIMARY KEY (timestamp, session_id),
                         FOREIGN KEY (session_id) REFERENCES sessions(session_id))''')
     conn.commit()
@@ -109,6 +112,12 @@ def simulate_wind_conditions():
     wind_angle = random.uniform(0, 180)
     return wind_speed, wind_angle
 
+# Add function to simulate GPS coordinates (after simulate_wind_conditions function)
+def simulate_gps_coordinates():
+    latitude = random.uniform(60.15, 60.17)
+    longitude = random.uniform(24.95, 24.97)
+    return latitude, longitude
+
 # Limit a value to a given range
 def limit(value, min_value, max_value):
     return max(min_value, min(value, max_value))
@@ -135,7 +144,7 @@ def calculate_theoretical_speed(wind_speed, wind_angle):
         return None
 
 # Store data in the database
-def store_data(conn, timestamp, speed, theoretical_speed, wind_speed, wind_angle):
+def store_data(conn, timestamp, speed, theoretical_speed, wind_speed, wind_angle, latitude, longitude):
     global current_session_id
     cursor = conn.cursor()
     try:
@@ -143,10 +152,10 @@ def store_data(conn, timestamp, speed, theoretical_speed, wind_speed, wind_angle
             theoretical_speed = 0.0
         theoretical_speed = float(theoretical_speed)
         cursor.execute('''INSERT INTO sensor_data 
-                         (timestamp, session_id, speed, theoretical_speed, wind_speed, wind_angle)
-                         VALUES (?, ?, ?, ?, ?, ?)''', 
+                         (timestamp, session_id, speed, theoretical_speed, wind_speed, wind_angle, latitude, longitude)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', 
                       (timestamp, current_session_id, speed, theoretical_speed, 
-                       wind_speed, wind_angle))
+                       wind_speed, wind_angle, latitude, longitude))
         conn.commit()
     except Exception as e:
         print(f"Error storing data: {e}")
@@ -159,21 +168,26 @@ def data_ingestion_thread():
     while data_ingestion_running:
         speed = next(sensor_data)
         wind_speed, wind_angle = simulate_wind_conditions()
+        latitude, longitude = simulate_gps_coordinates()
         theoretical_speed = calculate_theoretical_speed(wind_speed, wind_angle)
-        # Handle None values for theoretical speed
         if theoretical_speed is None:
             theoretical_speed = 0.0
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"Storing data: timestamp={timestamp}, speed={speed}, theoretical_speed={theoretical_speed}, wind_speed={wind_speed}, wind_angle={wind_angle}")
-        store_data(conn, timestamp, speed, theoretical_speed, wind_speed, wind_angle)
-    # Close the connection when the thread stops
+        store_data(conn, timestamp, speed, theoretical_speed, wind_speed, wind_angle, latitude, longitude)
     conn.close()
 
 # Dash app for real-time plotting
 def create_dash_app():
     app = dash.Dash(__name__)
     app.layout = html.Div([
-        dcc.Graph(id='live-graph'),
+        html.Div([
+            html.Div([
+                dcc.Graph(id='live-graph', style={'height': '45vh'}),
+            ], style={'width': '100%'}),
+            html.Div([
+                dcc.Graph(id='map-view', style={'height': '45vh'}),
+            ], style={'width': '100%'}),
+        ]),
         dcc.Interval(
             id='interval-component',
             interval=1000,
@@ -223,6 +237,7 @@ def create_dash_app():
 
     @app.callback(
     [Output('live-graph', 'figure'),
+     Output('map-view', 'figure'),
      Output('relayout-store', 'data'),
      Output('interval-component', 'disabled'),
      Output('session-selector', 'options')],
@@ -235,28 +250,32 @@ def create_dash_app():
      State('relayout-store', 'data'),
      State('ingestion-status-store', 'data')]
     )
-    def update_graph(n, n_clicks_plot, n_clicks_ingestion, selected_session,
-                    active_plots, relayout_data, stored_relayout_data, ingestion_status):
+    def update_graphs(n, n_clicks_plot, n_clicks_ingestion, selected_session,
+                     active_plots, relayout_data, stored_relayout_data, ingestion_status):
         conn = initialize_database()
         
         session_to_display = selected_session if selected_session else current_session_id
         
         if session_to_display:
             df = pd.read_sql_query(
-                "SELECT timestamp, speed, theoretical_speed, wind_speed FROM sensor_data "
-                "WHERE session_id = ? ORDER BY timestamp ASC",
+                """SELECT timestamp, speed, theoretical_speed, wind_speed, 
+                          latitude, longitude 
+                   FROM sensor_data 
+                   WHERE session_id = ? 
+                   ORDER BY timestamp ASC""",
                 conn, params=(session_to_display,))
         else:
-            df = pd.DataFrame(columns=['timestamp', 'speed', 'theoretical_speed', 'wind_speed'])
+            df = pd.DataFrame(columns=['timestamp', 'speed', 'theoretical_speed', 
+                                     'wind_speed', 'latitude', 'longitude'])
         
         conn.close()
 
         plot_mode = "net_value" if n_clicks_plot % 2 == 1 else "default"
-        fig = go.Figure()
+        fig_line = go.Figure()
 
         if plot_mode == "default":
             if 'actual' in active_plots:
-                fig.add_trace(go.Scatter(
+                fig_line.add_trace(go.Scatter(
                     x=df['timestamp'], 
                     y=df['speed'],
                     name='Actual Speed',
@@ -264,7 +283,7 @@ def create_dash_app():
                 ))
 
             if 'theoretical' in active_plots:
-                fig.add_trace(go.Scatter(
+                fig_line.add_trace(go.Scatter(
                     x=df['timestamp'],
                     y=df['theoretical_speed'],
                     name='Theoretical Speed',
@@ -272,7 +291,7 @@ def create_dash_app():
                 ))
 
             if 'wind' in active_plots:
-                fig.add_trace(go.Scatter(
+                fig_line.add_trace(go.Scatter(
                     x=df['timestamp'],
                     y=df['wind_speed'],
                     name='Wind Speed',
@@ -280,16 +299,42 @@ def create_dash_app():
                 ))
         else:
             net_values = df['speed'] - df['theoretical_speed']
-            fig.add_trace(go.Scatter(
+            fig_line.add_trace(go.Scatter(
                 x=df['timestamp'],
                 y=net_values,
                 name='Net Value (Actual - Theoretical)',
                 mode='lines+markers'
             ))
 
+        # Create the map view
+        fig_map = go.Figure()
+        
+        if not df.empty:
+            fig_map.add_trace(go.Scattermapbox(
+                lat=df['latitude'],
+                lon=df['longitude'],
+                mode='lines+markers',
+                marker=dict(size=8),
+                text=df['timestamp'],
+                name='Boat Track'
+            ))
+
+        fig_map.update_layout(
+            mapbox=dict(
+                style="open-street-map",
+                center=dict(
+                    lat=df['latitude'].mean() if not df.empty else 60.16,
+                    lon=df['longitude'].mean() if not df.empty else 24.96
+                ),
+                zoom=13
+            ),
+            margin=dict(l=0, r=0, t=0, b=0),
+            showlegend=True
+        )
+
         rangeslider_visible = not data_ingestion_running
 
-        fig.update_layout(
+        fig_line.update_layout(
             title_text="Real-Time Sailing Performance Analysis",
             xaxis=dict(
                 rangeslider=dict(visible=rangeslider_visible),
@@ -301,7 +346,7 @@ def create_dash_app():
         if relayout_data and 'xaxis.range[0]' in relayout_data:
             stored_relayout_data = relayout_data
         elif stored_relayout_data and 'xaxis.range[0]' in stored_relayout_data:
-            fig.update_xaxes(range=[
+            fig_line.update_xaxes(range=[
                 stored_relayout_data['xaxis.range[0]'],
                 stored_relayout_data['xaxis.range[1]']
             ])
@@ -309,7 +354,7 @@ def create_dash_app():
         interval_disabled = not data_ingestion_running
         session_options = get_sessions()
 
-        return fig, stored_relayout_data, interval_disabled, session_options
+        return fig_line, fig_map, stored_relayout_data, interval_disabled, session_options
 
     @app.callback(
         Output('upload-data', 'children'),
