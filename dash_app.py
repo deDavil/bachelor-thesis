@@ -1,3 +1,4 @@
+import math
 import threading
 import random
 import time
@@ -44,6 +45,7 @@ def initialize_database():
                         wind_angle REAL,
                         latitude REAL,
                         longitude REAL,
+                        vmg REAL,
                         PRIMARY KEY (timestamp, session_id),
                         FOREIGN KEY (session_id) REFERENCES sessions(session_id))''')
     conn.commit()
@@ -109,7 +111,7 @@ def load_sail_polar_data(contents):
 # Simulate wind conditions (wind speed and wind angle)
 def simulate_wind_conditions():
     wind_speed = random.uniform(5, 25)
-    wind_angle = random.uniform(0, 180)
+    wind_angle = random.uniform(-180, 180)
     return wind_speed, wind_angle
 
 # Add function to simulate GPS coordinates (after simulate_wind_conditions function)
@@ -124,6 +126,7 @@ def limit(value, min_value, max_value):
 
 # Calculate theoretical speed using interpolated sail polar data
 def calculate_theoretical_speed(wind_speed, wind_angle):
+    wind_angle = abs(wind_angle)
     global interpolator, twa_range, tws_range
     if interpolator is None:
         print("Error: Interpolator is not initialized.")
@@ -142,6 +145,11 @@ def calculate_theoretical_speed(wind_speed, wind_angle):
     except Exception as e:
         print(f"Error calculating theoretical speed: {e}")
         return None
+    
+def calculate_vmg(boat_speed, wind_angle):
+    angle_360 = wind_angle if wind_angle >= 0 else wind_angle + 360
+    signed_vmg = boat_speed * math.cos(math.radians(180 - angle_360))
+    return signed_vmg, abs(signed_vmg)
 
 # Store data in the database
 def store_data(conn, timestamp, speed, theoretical_speed, wind_speed, wind_angle, latitude, longitude):
@@ -151,11 +159,12 @@ def store_data(conn, timestamp, speed, theoretical_speed, wind_speed, wind_angle
         if theoretical_speed is None:
             theoretical_speed = 0.0
         theoretical_speed = float(theoretical_speed)
+        signed_vmg, abs_vmg = calculate_vmg(speed, wind_angle)
         cursor.execute('''INSERT INTO sensor_data 
-                         (timestamp, session_id, speed, theoretical_speed, wind_speed, wind_angle, latitude, longitude)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', 
+                         (timestamp, session_id, speed, theoretical_speed, wind_speed, wind_angle, latitude, longitude, vmg)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
                       (timestamp, current_session_id, speed, theoretical_speed, 
-                       wind_speed, wind_angle, latitude, longitude))
+                       wind_speed, wind_angle, latitude, longitude, signed_vmg))
         conn.commit()
     except Exception as e:
         print(f"Error storing data: {e}")
@@ -202,6 +211,7 @@ def create_dash_app():
                 {'label': 'Actual Speed', 'value': 'actual'},
                 {'label': 'Theoretical Speed', 'value': 'theoretical'},
                 {'label': 'Wind Speed', 'value': 'wind'},
+                {'label': 'VMG', 'value': 'vmg'},
             ],
             value=['actual', 'theoretical'],  # Default selected values
             inline=True,
@@ -232,7 +242,8 @@ def create_dash_app():
             multiple=False
         ),
         html.Button('Start/Stop Data Ingestion', id='start-stop-button', n_clicks=0),
-        html.Button('Switch to Net Value Plot', id='plot-mode-button', n_clicks=0)
+        html.Button('Switch to Net Value Plot', id='plot-mode-button', n_clicks=0),
+        html.Div(id='dashboard-readout', style={'border': '2px solid black', 'padding': '10px', 'margin': '10px'})
     ])
 
     @app.callback(
@@ -259,14 +270,14 @@ def create_dash_app():
         if session_to_display:
             df = pd.read_sql_query(
                 """SELECT timestamp, speed, theoretical_speed, wind_speed, 
-                          latitude, longitude 
+                          latitude, longitude, vmg 
                    FROM sensor_data 
                    WHERE session_id = ? 
                    ORDER BY timestamp ASC""",
                 conn, params=(session_to_display,))
         else:
             df = pd.DataFrame(columns=['timestamp', 'speed', 'theoretical_speed', 
-                                     'wind_speed', 'latitude', 'longitude'])
+                                     'wind_speed', 'latitude', 'longitude', 'vmg'])
         
         conn.close()
 
@@ -295,6 +306,14 @@ def create_dash_app():
                     x=df['timestamp'],
                     y=df['wind_speed'],
                     name='Wind Speed',
+                    mode='lines+markers'
+                ))
+
+            if 'vmg' in active_plots:
+                fig_line.add_trace(go.Scatter(
+                    x=df['timestamp'],
+                    y=df['vmg'],
+                    name='VMG',
                     mode='lines+markers'
                 ))
         else:
@@ -355,6 +374,73 @@ def create_dash_app():
         session_options = get_sessions()
 
         return fig_line, fig_map, stored_relayout_data, interval_disabled, session_options
+
+    @app.callback(
+        Output('dashboard-readout', 'children'),
+        Input('interval-component', 'n_intervals')
+    )
+    def update_dashboard(n):
+        # Query the latest sensor data row for the current session
+        conn = initialize_database()
+        if current_session_id:
+            df = pd.read_sql_query(
+                """SELECT speed, theoretical_speed, wind_speed, wind_angle, vmg
+                    FROM sensor_data 
+                    WHERE session_id=? 
+                    ORDER BY timestamp DESC 
+                    LIMIT 1""",
+                conn, params=(current_session_id,))
+        else:
+            df = pd.DataFrame()
+        conn.close()
+
+        if df.empty:
+            return "No data available yet."
+
+        latest = df.iloc[0]
+        actual_speed = latest['speed']
+        theoretical_speed = latest['theoretical_speed']
+        net_speed = actual_speed - theoretical_speed
+        wind_angle = latest['wind_angle']
+        wind_speed = latest['wind_speed']
+        
+        signed_vmg = latest['vmg']
+        abs_vmg = abs(signed_vmg)
+        direction = "upwind" if signed_vmg < 0 else "downwind"
+
+        # Create four "cards" with the requested metrics
+        dashboard = html.Div([
+            html.Div([
+                html.H4("Net Speed"),
+                html.P(f"{net_speed:.2f} knots", style={'fontSize': '1.5em'})
+            ], style={
+                'flex': '1', 'textAlign': 'center', 'padding': '10px', 
+                'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
+            }),
+            html.Div([
+                html.H4("VMG"),
+                html.P(f"{abs_vmg:.2f} knots ({direction})", style={'fontSize': '1.5em'})
+            ], style={
+                'flex': '1', 'textAlign': 'center', 'padding': '10px', 
+                'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
+            }),
+            html.Div([
+                html.H4("Wind Angle"),
+                html.P(f"{wind_angle:.1f}°", style={'fontSize': '1.5em'})
+            ], style={
+                'flex': '1', 'textAlign': 'center', 'padding': '10px', 
+                'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
+            }),
+            html.Div([
+                html.H4("Wind Speed"),
+                html.P(f"{wind_speed:.2f} knots", style={'fontSize': '1.5em'})
+            ], style={
+                'flex': '1', 'textAlign': 'center', 'padding': '10px', 
+                'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
+            }),
+        ], style={'display': 'flex', 'flexWrap': 'wrap'})
+
+        return dashboard
 
     @app.callback(
         Output('upload-data', 'children'),
