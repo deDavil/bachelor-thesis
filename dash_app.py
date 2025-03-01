@@ -25,6 +25,32 @@ tws_range = None
 plot_mode = "default"
 current_session_id = None
 
+# Define values for the "dashboard"
+last_displayed_values = {
+    'vmg': None,
+    'speed': None,
+    'net_speed': None,
+    'wind_angle': None,
+    'wind_speed': None,
+    'last_display_time': None
+}
+
+current_changes = {
+    'vmg': 0,
+    'speed': 0,
+    'net_speed': 0,
+    'wind_angle': 0,
+    'wind_speed': 0
+}
+
+previous_values = {
+    'vmg': [],
+    'speed': [],
+    'net_speed': [],
+    'wind_angle': [],
+    'wind_speed': []
+}
+
 def initialize_database():
     conn = sqlite3.connect('sailing_data.db', check_same_thread=False)
     cursor = conn.cursor()
@@ -380,11 +406,13 @@ def create_dash_app():
         Input('interval-component', 'n_intervals')
     )
     def update_dashboard(n):
+        global last_displayed_values, previous_values, current_changes
+        current_time = datetime.now()
         # Query the latest sensor data row for the current session
         conn = initialize_database()
         if current_session_id:
             df = pd.read_sql_query(
-                """SELECT speed, theoretical_speed, wind_speed, wind_angle, vmg
+                """SELECT speed, theoretical_speed, wind_speed, wind_angle, vmg, timestamp
                     FROM sensor_data 
                     WHERE session_id=? 
                     ORDER BY timestamp DESC 
@@ -398,42 +426,103 @@ def create_dash_app():
             return "No data available yet."
 
         latest = df.iloc[0]
-        actual_speed = latest['speed']
-        theoretical_speed = latest['theoretical_speed']
-        net_speed = actual_speed - theoretical_speed
-        wind_angle = latest['wind_angle']
-        wind_speed = latest['wind_speed']
         
-        signed_vmg = latest['vmg']
-        abs_vmg = abs(signed_vmg)
-        direction = "upwind" if signed_vmg < 0 else "downwind"
+        # Store current values
+        current_values = {
+            'vmg': latest['vmg'],
+            'speed': latest['speed'],
+            'net_speed': latest['speed'] - latest['theoretical_speed'],
+            'wind_angle': latest['wind_angle'],
+            'wind_speed': latest['wind_speed']
+        }
+        
+        # Add current values to previous values lists
+        for key, value in current_values.items():
+            previous_values[key].append(value)
+            # Keep only last 3 seconds of data
+            if len(previous_values[key]) > 3:
+                previous_values[key].pop(0)
 
-        # Create four "cards" with the requested metrics
+        # Check if it's time to update changes (every 3 seconds)
+        should_update_changes = (
+            last_displayed_values['last_display_time'] is None or
+            (current_time - last_displayed_values['last_display_time']).total_seconds() >= 3
+        )
+
+        if should_update_changes:
+            # Calculate new changes
+            for key in current_values.keys():
+                if last_displayed_values[key] is not None:
+                    # Calculate both instant and average changes
+                    instant_change = current_values[key] - last_displayed_values[key]
+                    if len(previous_values[key]) >= 3:
+                        avg_change = current_values[key] - sum(previous_values[key][:-1]) / len(previous_values[key][:-1])
+                        current_changes[key] = avg_change
+                    else:
+                        current_changes[key] = instant_change
+                else:
+                    current_changes[key] = 0
+
+            # Update last displayed values for next change calculation
+            last_displayed_values = current_values.copy()
+            last_displayed_values['last_display_time'] = current_time
+
+        def get_color_style(change):
+            if abs(change) < 0.01:  # Threshold for considering no significant change
+                return {'color': 'black'}
+            return {'color': 'green' if change > 0 else 'red'}
+
+        def format_change(value, change):
+            change_text = f"{abs(change):+.2f}" if abs(change) >= 0.01 else "±0.00"
+            return html.Div([
+                html.Span(f"{value:.2f}", style={'fontSize': '1.5em'}),
+                html.Br(),
+                html.Span(change_text, style=get_color_style(change))
+            ])
+
+        # VMG direction
+        direction = "upwind" if current_values['vmg'] < 0 else "downwind"
+        
+        # Create dashboard cards with changes
         dashboard = html.Div([
             html.Div([
-                html.H4("Net Speed"),
-                html.P(f"{net_speed:.2f} knots", style={'fontSize': '1.5em'})
+                html.H4("Actual Speed"),
+                format_change(current_values['speed'], current_changes['speed']),
+                html.Span("knots")
+            ], style={
+                'flex': '1', 'textAlign': 'center', 'padding': '10px', 
+                'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
+            }),
+            html.Div([
+                html.H4("Speed potential"),
+                format_change(current_values['net_speed'], current_changes['net_speed']),
+                html.Span("knots")
             ], style={
                 'flex': '1', 'textAlign': 'center', 'padding': '10px', 
                 'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
             }),
             html.Div([
                 html.H4("VMG"),
-                html.P(f"{abs_vmg:.2f} knots ({direction})", style={'fontSize': '1.5em'})
+                format_change(abs(current_values['vmg']), current_changes['vmg']),
+                html.Div([
+                    html.Span(f"knots ({direction})")
+                ])
             ], style={
                 'flex': '1', 'textAlign': 'center', 'padding': '10px', 
                 'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
             }),
             html.Div([
                 html.H4("Wind Angle"),
-                html.P(f"{wind_angle:.1f}°", style={'fontSize': '1.5em'})
+                format_change(current_values['wind_angle'], current_changes['wind_angle']),
+                html.Span("degrees")
             ], style={
                 'flex': '1', 'textAlign': 'center', 'padding': '10px', 
                 'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
             }),
             html.Div([
                 html.H4("Wind Speed"),
-                html.P(f"{wind_speed:.2f} knots", style={'fontSize': '1.5em'})
+                format_change(current_values['wind_speed'], current_changes['wind_speed']),
+                html.Span("knots")
             ], style={
                 'flex': '1', 'textAlign': 'center', 'padding': '10px', 
                 'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
