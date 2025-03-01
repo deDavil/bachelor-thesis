@@ -15,6 +15,8 @@ import io
 import uuid
 import numpy as np
 import plotly.express as px
+import json
+from collections import deque
 
 # Global vars
 sail_polar_data = None
@@ -24,6 +26,7 @@ twa_range = None
 tws_range = None
 plot_mode = "default"
 current_session_id = None
+tracking_data = deque()
 
 # Define values for the "dashboard"
 last_displayed_values = {
@@ -113,11 +116,30 @@ def get_sessions():
              'value': session_id} 
             for idx, (session_id, start_time, end_time) in enumerate(sessions)]
 
-# Mock sensor data generator
-def mock_sensor_data():
-    while True:
-        speed = random.uniform(0, 20)
-        yield speed
+# Add function to load tracking data
+def load_tracking_data(file_path):
+    global tracking_data
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+        # Convert the data frames to a deque for FIFO operations
+        tracking_data = deque(data['dframes'])
+
+def real_sensor_data():
+    global tracking_data
+    while tracking_data:
+        # Get next data frame
+        frame = tracking_data.popleft()
+        # Extract measured values (not calculated ones)
+        data = {
+            'latitude': frame[0],  # _lat
+            'longitude': frame[1], # _lon
+            'speed': frame[3],     # sog
+            'wind_speed': frame[7],# wspeed
+            'wind_angle': frame[8], # wangle
+            'wind_direction': frame[11] # wind direction
+        }
+        yield data
+        tracking_data.append(frame)
         time.sleep(1)
 
 # Load sail polar data from a CSV file
@@ -133,18 +155,6 @@ def load_sail_polar_data(contents):
     twa_range = (min(twa), max(twa))
     tws_range = (min(tws), max(tws))
     return data
-
-# Simulate wind conditions (wind speed and wind angle)
-def simulate_wind_conditions():
-    wind_speed = random.uniform(5, 25)
-    wind_angle = random.uniform(-180, 180)
-    return wind_speed, wind_angle
-
-# Add function to simulate GPS coordinates (after simulate_wind_conditions function)
-def simulate_gps_coordinates():
-    latitude = random.uniform(60.15, 60.17)
-    longitude = random.uniform(24.95, 24.97)
-    return latitude, longitude
 
 # Limit a value to a given range
 def limit(value, min_value, max_value):
@@ -195,25 +205,29 @@ def store_data(conn, timestamp, speed, theoretical_speed, wind_speed, wind_angle
     except Exception as e:
         print(f"Error storing data: {e}")
 
-# Data ingestion and processing thread
+# Update data_ingestion_thread to use real data
 def data_ingestion_thread():
     global data_ingestion_running
     conn = initialize_database()
-    sensor_data = mock_sensor_data()
+    sensor_data = real_sensor_data()
     while data_ingestion_running:
-        speed = next(sensor_data)
-        wind_speed, wind_angle = simulate_wind_conditions()
-        latitude, longitude = simulate_gps_coordinates()
-        theoretical_speed = calculate_theoretical_speed(wind_speed, wind_angle)
+        data = next(sensor_data)
+        theoretical_speed = calculate_theoretical_speed(data['wind_speed'], data['wind_angle'])
         if theoretical_speed is None:
             theoretical_speed = 0.0
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        store_data(conn, timestamp, speed, theoretical_speed, wind_speed, wind_angle, latitude, longitude)
+        store_data(conn, timestamp, data['speed'], theoretical_speed, 
+                  data['wind_speed'], data['wind_angle'], 
+                  data['latitude'], data['longitude'])
     conn.close()
 
 # Dash app for real-time plotting
 def create_dash_app():
     app = dash.Dash(__name__)
+    
+    # Load tracking data at startup
+    load_tracking_data('data/Tracking_example_data_1.json')
+    
     app.layout = html.Div([
         html.Div([
             html.Div([
@@ -364,18 +378,35 @@ def create_dash_app():
                 name='Boat Track'
             ))
 
-        fig_map.update_layout(
-            mapbox=dict(
-                style="open-street-map",
-                center=dict(
-                    lat=df['latitude'].mean() if not df.empty else 60.16,
-                    lon=df['longitude'].mean() if not df.empty else 24.96
+            # Update center to use actual coordinates
+            center_lat = df['latitude'].iloc[-1]
+            center_lon = df['longitude'].iloc[-1]
+
+            fig_map.update_layout(
+                mapbox=dict(
+                    style="open-street-map",
+                    center=dict(
+                        lat=center_lat,
+                        lon=center_lon
+                    ),
+                    zoom=15
                 ),
-                zoom=13
-            ),
-            margin=dict(l=0, r=0, t=0, b=0),
-            showlegend=True
-        )
+                margin=dict(l=0, r=0, t=0, b=0),
+                showlegend=True
+            )
+        else:
+            fig_map.update_layout(
+                mapbox=dict(
+                    style="open-street-map",
+                    center=dict(
+                        lat=df['latitude'].mean(),
+                        lon=df['longitude'].mean()
+                    ),
+                    zoom=13
+                ),
+                margin=dict(l=0, r=0, t=0, b=0),
+                showlegend=True
+            )
 
         rangeslider_visible = not data_ingestion_running
 
