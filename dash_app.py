@@ -221,7 +221,46 @@ def data_ingestion_thread():
                   data['latitude'], data['longitude'])
     conn.close()
 
-# Dash app for real-time plotting
+def calculate_wind_shift(angles):
+    if len(angles) < 2:
+        return 0
+    
+    # Convert angles to handle 0/360 crossings
+    shifts = []
+    for i in range(1, len(angles)):
+        shift = angles[i] - angles[i-1]
+        # Handle angle wrapping
+        if shift > 180:
+            shift -= 360
+        elif shift < -180:
+            shift += 360
+        shifts.append(shift)
+    
+    return sum(shifts) / len(shifts)
+
+def analyze_wind_trend(speeds, angles, timespan):
+    if not speeds or not angles:
+        return {
+            'speed_trend': 0,
+            'direction_trend': 0,
+            'avg_speed': 0,
+            'avg_direction': 0
+        }
+    
+    avg_speed = sum(speeds) / len(speeds)
+    speed_trend = speeds[-1] - speeds[0] if len(speeds) > 1 else 0
+    
+    direction_trend = calculate_wind_shift(angles)
+    avg_direction = sum(angles) / len(angles)
+    
+    return {
+        'speed_trend': speed_trend,
+        'direction_trend': direction_trend,
+        'avg_speed': avg_speed,
+        'avg_direction': avg_direction
+    }
+
+# Update the app layout to include wind trend controls and display
 def create_dash_app():
     app = dash.Dash(__name__)
     
@@ -283,7 +322,29 @@ def create_dash_app():
         ),
         html.Button('Start/Stop Data Ingestion', id='start-stop-button', n_clicks=0),
         html.Button('Switch to Net Value Plot', id='plot-mode-button', n_clicks=0),
-        html.Div(id='dashboard-readout', style={'border': '2px solid black', 'padding': '10px', 'margin': '10px'})
+        html.Div(id='dashboard-readout', style={'border': '2px solid black', 'padding': '10px', 'margin': '10px'}),
+        html.Div([
+            html.Div([
+                html.H4("Wind Trend Analysis"),
+                dcc.Dropdown(
+                    id='wind-trend-timespan',
+                    options=[
+                        {'label': '30 seconds', 'value': 30},
+                        {'label': '1 minute', 'value': 60},
+                        {'label': '2 minutes', 'value': 120},
+                        {'label': '5 minutes', 'value': 300},
+                    ],
+                    value=60,
+                    style={'width': '200px', 'margin': '10px'}
+                ),
+                html.Div(id='wind-trend-display')
+            ], style={
+                'border': '2px solid black',
+                'padding': '10px',
+                'margin': '10px',
+                'backgroundColor': '#f8f9fa'
+            })
+        ])
     ])
 
     @app.callback(
@@ -458,9 +519,9 @@ def create_dash_app():
 
         latest = df.iloc[0]
         
-        # Store current values
+        # Store current values - modify the VMG line to use absolute value
         current_values = {
-            'vmg': latest['vmg'],
+            'vmg': abs(latest['vmg']),  # Use absolute VMG value
             'speed': latest['speed'],
             'net_speed': latest['speed'] - latest['theoretical_speed'],
             'wind_angle': latest['wind_angle'],
@@ -504,16 +565,14 @@ def create_dash_app():
             return {'color': 'green' if change > 0 else 'red'}
 
         def format_change(value, change):
-            change_text = f"{abs(change):+.2f}" if abs(change) >= 0.01 else "±0.00"
+            # Remove abs() from change display
+            change_text = f"{change:+.2f}" if abs(change) >= 0.01 else "±0.00"
             return html.Div([
                 html.Span(f"{value:.2f}", style={'fontSize': '1.5em'}),
                 html.Br(),
                 html.Span(change_text, style=get_color_style(change))
             ])
 
-        # VMG direction
-        direction = "upwind" if current_values['vmg'] < 0 else "downwind"
-        
         # Create dashboard cards with changes
         dashboard = html.Div([
             html.Div([
@@ -536,7 +595,7 @@ def create_dash_app():
                 html.H4("VMG"),
                 format_change(abs(current_values['vmg']), current_changes['vmg']),
                 html.Div([
-                    html.Span(f"knots ({direction})")
+                    html.Span("knots")
                 ])
             ], style={
                 'flex': '1', 'textAlign': 'center', 'padding': '10px', 
@@ -557,7 +616,7 @@ def create_dash_app():
             ], style={
                 'flex': '1', 'textAlign': 'center', 'padding': '10px', 
                 'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'margin': '5px'
-            }),
+            })
         ], style={'display': 'flex', 'flexWrap': 'wrap'})
 
         return dashboard
@@ -598,6 +657,85 @@ def create_dash_app():
             end_current_session()
             return "Start Data Ingestion", False, None
     
+    @app.callback(
+        Output('wind-trend-display', 'children'),
+        [Input('interval-component', 'n_intervals'),
+         Input('wind-trend-timespan', 'value')]
+    )
+    def update_wind_trend(n, timespan):
+        if not current_session_id:
+            return "No data available"
+            
+        # Get wind data for the selected timespan
+        conn = initialize_database()
+        end_time = datetime.now()
+        start_time = end_time - pd.Timedelta(seconds=timespan)
+        
+        df = pd.read_sql_query(
+            """SELECT wind_speed, wind_angle, timestamp
+               FROM sensor_data 
+               WHERE session_id = ? 
+               AND timestamp BETWEEN ? AND ?
+               ORDER BY timestamp ASC""",
+            conn,
+            params=(current_session_id, 
+                   start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                   end_time.strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        conn.close()
+        
+        if df.empty:
+            return "Insufficient data for analysis"
+        
+        # Analyze wind trends
+        trend = analyze_wind_trend(
+            df['wind_speed'].tolist(),
+            df['wind_angle'].tolist(),
+            timespan
+        )
+        
+        # Create trend indicators
+        def get_trend_arrow(value):
+            if abs(value) < 0.5:  # Threshold for "steady"
+                return "→"
+            return "↗" if value > 0 else "↘"
+        
+        def get_trend_text(value):
+            if abs(value) < 0.5:
+                return "steady"
+            return "increasing" if value > 0 else "decreasing"
+        
+        def get_shift_text(value):
+            if abs(value) < 0.5:
+                return "steady"
+            return "shifting right" if value > 0 else "shifting left"
+        
+        return html.Div([
+            html.Div([
+                html.H5("Wind Speed", style={'marginBottom': '5px'}),
+                html.Div([
+                    html.Span(f"{trend['avg_speed']:.1f} knots ", style={'fontSize': '1.2em'}),
+                    html.Span(get_trend_arrow(trend['speed_trend']), 
+                            style={'fontSize': '1.5em', 
+                                  'color': 'green' if trend['speed_trend'] > 0 else 'red'}),
+                ]),
+                html.Div(get_trend_text(trend['speed_trend']),
+                        style={'fontSize': '0.9em', 'color': 'gray'})
+            ], style={'marginBottom': '15px'}),
+            
+            html.Div([
+                html.H5("Wind Direction", style={'marginBottom': '5px'}),
+                html.Div([
+                    html.Span(f"{trend['avg_direction']:.1f}° ", style={'fontSize': '1.2em'}),
+                    html.Span(get_trend_arrow(trend['direction_trend']), 
+                            style={'fontSize': '1.5em',
+                                  'color': 'orange'})
+                ]),
+                html.Div(get_shift_text(trend['direction_trend']),
+                        style={'fontSize': '0.9em', 'color': 'gray'})
+            ])
+        ])
+
     return app
 
 # Run the Dash app
